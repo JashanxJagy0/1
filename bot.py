@@ -13,6 +13,7 @@ import secrets # For secure token generation
 import hashlib # For hashing PINs
 import hmac # For secure key derivation
 import traceback # For detailed error logging
+import uuid # For generating unique rain IDs
 
 # Suppress PTB warnings
 warnings.filterwarnings('ignore', category=DeprecationWarning)
@@ -243,6 +244,13 @@ TOKEN_CONTRACTS = {
 MIN_DEPOSIT_USD = 10.0       # Minimum deposit amount in USD
 SCAN_INTERVAL = 30            # How often to scan for deposits (seconds)
 SWEEP_INTERVAL = 60           # How often to process sweeps (seconds)
+
+# ========================================
+# 🌧️ RAIN SETTINGS
+# ========================================
+RAIN_MIN_AMOUNT = 1.0         # Minimum USD value that can be rained
+RAIN_DURATION_SECONDS = 60    # How long the rain window stays open (seconds)
+RAIN_MIN_PARTICIPANTS = 1     # Minimum number of participants for rain to pay out
 
 # Required confirmations before crediting deposit
 CONFIRMATIONS = {
@@ -1783,6 +1791,32 @@ class DepositDatabase:
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_deposits_user ON deposits(user_id)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_deposits_status ON deposits(status)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_deposits_chain ON deposits(chain)')
+
+        # Rains table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS rains (
+                rain_id TEXT PRIMARY KEY,
+                chat_id INTEGER NOT NULL,
+                message_id INTEGER,
+                creator_id INTEGER NOT NULL,
+                creator_username TEXT,
+                amount REAL NOT NULL,
+                currency TEXT NOT NULL,
+                end_time TIMESTAMP NOT NULL,
+                status TEXT DEFAULT 'active'
+            )
+        ''')
+
+        # Rain participants table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS rain_participants (
+                rain_id TEXT NOT NULL,
+                user_id INTEGER NOT NULL,
+                username TEXT,
+                PRIMARY KEY (rain_id, user_id),
+                FOREIGN KEY (rain_id) REFERENCES rains(rain_id)
+            )
+        ''')
         
         conn.commit()
         conn.close()
@@ -1982,6 +2016,87 @@ class DepositDatabase:
         if user:
             return {'user_id': user[0], 'telegram_id': user[1], 'address_index': user[2]}
         return None
+
+    # ── Rain helpers ──────────────────────────────────────────────────────
+
+    def create_rain(self, rain_id, chat_id, creator_id, creator_username, amount, currency, end_time):
+        """Insert a new rain record. Returns True on success."""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute('''
+                INSERT INTO rains (rain_id, chat_id, creator_id, creator_username, amount, currency, end_time, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 'active')
+            ''', (rain_id, chat_id, creator_id, creator_username, amount, currency, end_time))
+            conn.commit()
+            return True
+        except Exception as e:
+            logging.error(f"create_rain error: {e}")
+            return False
+        finally:
+            conn.close()
+
+    def set_rain_message_id(self, rain_id, message_id):
+        """Store the message_id for the rain announcement message."""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute('UPDATE rains SET message_id = ? WHERE rain_id = ?', (message_id, rain_id))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def get_rain(self, rain_id):
+        """Fetch a single rain row as a dict."""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT rain_id, chat_id, message_id, creator_id, creator_username,
+                   amount, currency, end_time, status
+            FROM rains WHERE rain_id = ?
+        ''', (rain_id,))
+        row = cursor.fetchone()
+        conn.close()
+        if not row:
+            return None
+        keys = ['rain_id', 'chat_id', 'message_id', 'creator_id', 'creator_username',
+                'amount', 'currency', 'end_time', 'status']
+        return dict(zip(keys, row))
+
+    def add_rain_participant(self, rain_id, user_id, username):
+        """Add a participant to a rain. Returns True if newly added, False if duplicate."""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute('''
+                INSERT INTO rain_participants (rain_id, user_id, username)
+                VALUES (?, ?, ?)
+            ''', (rain_id, user_id, username))
+            conn.commit()
+            return True
+        except sqlite3.IntegrityError:
+            return False  # Already joined (UNIQUE constraint)
+        finally:
+            conn.close()
+
+    def get_rain_participants(self, rain_id):
+        """Return list of (user_id, username) tuples for a rain."""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('SELECT user_id, username FROM rain_participants WHERE rain_id = ?', (rain_id,))
+        rows = cursor.fetchall()
+        conn.close()
+        return rows
+
+    def complete_rain(self, rain_id):
+        """Mark a rain as completed."""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        try:
+            cursor.execute("UPDATE rains SET status = 'completed' WHERE rain_id = ?", (rain_id,))
+            conn.commit()
+        finally:
+            conn.close()
 
 
 class HDWalletManager:
@@ -2301,6 +2416,43 @@ class EvmService:
         except Exception as e:
             logging.error(f"Error scanning address: {e}")
             return [], None
+
+    async def get_erc20_deposits(self, address, token_contract, decimals, from_block, to_block):
+        """Get incoming ERC20 Transfer events to address in block range using eth_getLogs"""
+        try:
+            TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+            # Pad address to 32-byte topic (left-pad with zeros)
+            padded_address = "0x" + address.lower().replace("0x", "").zfill(64)
+
+            logs = self.w3.eth.get_logs({
+                'fromBlock': from_block,
+                'toBlock': to_block,
+                'address': Web3.to_checksum_address(token_contract),
+                'topics': [TRANSFER_TOPIC, None, padded_address]
+            })
+
+            transfers = []
+            for log in logs:
+                # log['data'] is HexBytes in web3.py; convert to int via hex string
+                amount_wei = int(log['data'].hex(), 16)
+                amount = amount_wei / (10 ** decimals)
+                transfers.append({
+                    'tx_hash': log['transactionHash'].hex(),
+                    'block_number': log['blockNumber'],
+                    'amount': amount,
+                })
+            return transfers
+        except Exception as e:
+            logging.error(f"Error getting ERC20 deposits for {address} on {self.chain}: {e}")
+            return []
+
+    async def wait_for_receipt(self, tx_hash, timeout=120):
+        """Wait for a transaction to be mined, running the blocking call in an executor"""
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            None,
+            lambda: self.w3.eth.wait_for_transaction_receipt(tx_hash, timeout=timeout)
+        )
 
 
 class TronService:
@@ -2665,114 +2817,183 @@ class BlockMonitor:
     
     async def _scan_address(self, chain, address, user_id, telegram_id):
         """Scan single address for deposits"""
+        # Map each chain to its native coin symbol
+        NATIVE_SYMBOLS = {
+            'ETH': 'ETH',
+            'BNB': 'BNB',
+            'BASE': 'ETH',
+            'TRON': 'TRX',
+            'SOLANA': 'SOL',
+            'TON': 'TON',
+        }
         try:
             service = self.services.get(chain)
             if not service:
                 return
-            
-            # Check native balance
+
+            # ── Native balance delta ─────────────────────────────────────────
             balance = await service.get_balance(address)
-            if balance > 0.0001:  # Minimum threshold
-                # Check if already recorded
-                conn = self.db.get_connection()
-                cursor = conn.cursor()
-                cursor.execute('''
-                    SELECT id, confirmations FROM deposits 
-                    WHERE user_id = ? AND chain = ? AND to_address = ? AND token IS NULL
-                    AND status IN ('pending', 'confirmed')
-                    ORDER BY created_at DESC LIMIT 1
-                ''', (user_id, chain, address))
-                
-                existing = cursor.fetchone()
-                
-                if not existing:
-                    # New deposit detected - get price
-                    symbol = 'ETH' if chain == 'BASE' else chain.replace('CHAIN', '')
-                    price_usd = await get_crypto_price_usd(symbol)
-                    amount_usd = balance * price_usd
-                    
-                    tx_hash = f"native_{chain}_{address}_{int(datetime.now().timestamp())}"
-                    
-                    self.db.add_deposit(
-                        tx_hash=tx_hash,
-                        user_id=user_id,
-                        chain=chain,
-                        amount=balance,
-                        amount_usd=amount_usd,
-                        to_address=address
-                    )
-                    
-                    logging.info(f"New deposit detected: {balance} {chain} for user {telegram_id} (${amount_usd:.2f})")
-                    
-                    # Update confirmations - simulate confirmation tracking
+
+            conn = self.db.get_connection()
+            cursor = conn.cursor()
+            # Sum of native deposits already recorded but not yet swept
+            cursor.execute('''
+                SELECT COALESCE(SUM(amount), 0) FROM deposits
+                WHERE user_id = ? AND chain = ? AND to_address = ? AND token IS NULL
+                AND status IN ('pending', 'confirmed')
+            ''', (user_id, chain, address))
+            recorded_unswept = float(cursor.fetchone()[0])
+            conn.close()
+
+            new_native_amount = balance - recorded_unswept
+            if new_native_amount > 0.0001:  # Minimum threshold
+                symbol = NATIVE_SYMBOLS.get(chain, chain)
+                price_usd = await get_crypto_price_usd(symbol)
+                amount_usd = new_native_amount * price_usd
+                tx_hash = f"native_{chain}_{address}_{int(datetime.now().timestamp())}"
+
+                deposit_id = self.db.add_deposit(
+                    tx_hash=tx_hash,
+                    user_id=user_id,
+                    chain=chain,
+                    amount=new_native_amount,
+                    amount_usd=amount_usd,
+                    to_address=address
+                )
+
+                if deposit_id:
+                    logging.info(f"New native deposit: {new_native_amount} {symbol} for user {telegram_id} (${amount_usd:.2f})")
                     required_confs = CONFIRMATIONS.get(chain, 10)
                     self.db.update_deposit_status(tx_hash, 'confirmed', confirmations=required_confs)
-                    
-                    # Credit user only after confirmations
+
                     if telegram_id in user_wallets:
-                        credit_wallet(telegram_id, amount_usd)
-                        # Track deposit for wager requirement (2x)
+                        credit_wallet_crypto(telegram_id, new_native_amount, symbol)
                         if telegram_id in user_stats:
-                            user_stats[telegram_id]["unwagered_deposit"] = user_stats[telegram_id].get("unwagered_deposit", 0.0) + amount_usd
+                            user_stats[telegram_id]["unwagered_deposit"] = (
+                                user_stats[telegram_id].get("unwagered_deposit", 0.0) + amount_usd
+                            )
                         save_user_data(telegram_id)
-                        logging.info(f"Credited ${amount_usd:.2f} to user {telegram_id}")
-                
-                conn.close()
-            
-            # Check token balances
+                        logging.info(f"Credited {new_native_amount} {symbol} to user {telegram_id}")
+
+            # ── Token deposits ───────────────────────────────────────────────
             if chain in TOKEN_CONTRACTS:
                 for token_name, token_info in TOKEN_CONTRACTS[chain].items():
-                    if chain == 'SOLANA':
-                        token_balance = await service.get_token_balance(address, token_info['mint'])
+
+                    # EVM chains: use Transfer event logs so each tx is tracked individually
+                    if chain in ('ETH', 'BNB', 'BASE') and hasattr(service, 'get_erc20_deposits'):
+                        track_key = (chain, address, token_name)
+                        current_block = service.w3.eth.block_number
+                        from_block = self.last_scanned_blocks.get(track_key)
+                        if from_block is None:
+                            # First scan – look back ~100 blocks (~20 min on ETH/BNB) to avoid
+                            # re-crediting deposits that were processed before the last restart.
+                            from_block = max(0, current_block - 100)
+                        else:
+                            from_block = from_block + 1
+
+                        if from_block <= current_block:
+                            transfers = await service.get_erc20_deposits(
+                                address,
+                                token_info['address'],
+                                token_info['decimals'],
+                                from_block,
+                                current_block
+                            )
+                            self.last_scanned_blocks[track_key] = current_block
+
+                            for transfer in transfers:
+                                tx_hash = transfer['tx_hash']
+                                token_amount = transfer['amount']
+
+                                if token_amount < 1:
+                                    continue
+
+                                # Skip if this tx_hash is already in the database
+                                conn = self.db.get_connection()
+                                cursor = conn.cursor()
+                                cursor.execute('SELECT id FROM deposits WHERE tx_hash = ?', (tx_hash,))
+                                already_exists = cursor.fetchone()
+                                conn.close()
+                                if already_exists:
+                                    continue
+
+                                amount_usd = token_amount  # Assumes stablecoin (USDT/USDC) 1:1 with USD
+                                deposit_id = self.db.add_deposit(
+                                    tx_hash=tx_hash,
+                                    user_id=user_id,
+                                    chain=chain,
+                                    token=token_name,
+                                    amount=token_amount,
+                                    amount_usd=amount_usd,
+                                    to_address=address,
+                                    block_number=transfer['block_number']
+                                )
+
+                                if deposit_id:
+                                    logging.info(f"New token deposit: {token_amount} {token_name} on {chain} for user {telegram_id} (tx: {tx_hash})")
+                                    required_confs = CONFIRMATIONS.get(chain, 10)
+                                    self.db.update_deposit_status(tx_hash, 'confirmed', confirmations=required_confs)
+
+                                    if telegram_id in user_wallets:
+                                        credit_wallet_crypto(telegram_id, token_amount, token_name)
+                                        if telegram_id in user_stats:
+                                            user_stats[telegram_id]["unwagered_deposit"] = (
+                                                user_stats[telegram_id].get("unwagered_deposit", 0.0) + amount_usd
+                                            )
+                                        save_user_data(telegram_id)
+                                        logging.info(f"Credited {token_amount} {token_name} to user {telegram_id}")
+
                     else:
-                        token_balance = await service.get_token_balance(
-                            address, 
-                            token_info['address'],
-                            token_info['decimals']
-                        )
-                    
-                    if token_balance > 1:  # Minimum 1 token
-                        # Check if already recorded
+                        # Non-EVM chains (TRON, SOLANA) or fallback: use balance delta
+                        if chain == 'SOLANA':
+                            token_balance = await service.get_token_balance(address, token_info['mint'])
+                        else:
+                            token_balance = await service.get_token_balance(
+                                address,
+                                token_info['address'],
+                                token_info['decimals']
+                            )
+
+                        # Sum of token deposits already recorded but not yet swept
                         conn = self.db.get_connection()
                         cursor = conn.cursor()
                         cursor.execute('''
-                            SELECT id FROM deposits 
-                            WHERE user_id = ? AND chain = ? AND to_address = ? AND token = ? 
+                            SELECT COALESCE(SUM(amount), 0) FROM deposits
+                            WHERE user_id = ? AND chain = ? AND to_address = ? AND token = ?
                             AND status IN ('pending', 'confirmed')
-                            ORDER BY created_at DESC LIMIT 1
                         ''', (user_id, chain, address, token_name))
-                        
-                        if not cursor.fetchone():
+                        recorded_token_unswept = float(cursor.fetchone()[0])
+                        conn.close()
+
+                        new_token_amount = token_balance - recorded_token_unswept
+                        if new_token_amount > 1:  # Minimum 1 token
                             tx_hash = f"token_{chain}_{token_name}_{address}_{int(datetime.now().timestamp())}"
-                            amount_usd = token_balance  # USDT/USDC are 1:1 with USD
-                            
-                            self.db.add_deposit(
+                            amount_usd = new_token_amount  # Assumes stablecoin (USDT/USDC) 1:1 with USD
+
+                            deposit_id = self.db.add_deposit(
                                 tx_hash=tx_hash,
                                 user_id=user_id,
                                 chain=chain,
                                 token=token_name,
-                                amount=token_balance,
+                                amount=new_token_amount,
                                 amount_usd=amount_usd,
                                 to_address=address
                             )
-                            
-                            logging.info(f"New token deposit: {token_balance} {token_name} on {chain} for user {telegram_id}")
-                            
-                            # Update confirmations and credit
-                            required_confs = CONFIRMATIONS.get(chain, 10)
-                            self.db.update_deposit_status(tx_hash, 'confirmed', confirmations=required_confs)
-                            
-                            # Credit user only after confirmations
-                            if telegram_id in user_wallets:
-                                credit_wallet(telegram_id, amount_usd)
-                                # Track deposit for wager requirement (2x)
-                                if telegram_id in user_stats:
-                                    user_stats[telegram_id]["unwagered_deposit"] = user_stats[telegram_id].get("unwagered_deposit", 0.0) + amount_usd
-                                save_user_data(telegram_id)
-                                logging.info(f"Credited ${amount_usd:.2f} to user {telegram_id}")
-                        
-                        conn.close()
-            
+
+                            if deposit_id:
+                                logging.info(f"New token deposit: {new_token_amount} {token_name} on {chain} for user {telegram_id}")
+                                required_confs = CONFIRMATIONS.get(chain, 10)
+                                self.db.update_deposit_status(tx_hash, 'confirmed', confirmations=required_confs)
+
+                                if telegram_id in user_wallets:
+                                    credit_wallet_crypto(telegram_id, new_token_amount, token_name)
+                                    if telegram_id in user_stats:
+                                        user_stats[telegram_id]["unwagered_deposit"] = (
+                                            user_stats[telegram_id].get("unwagered_deposit", 0.0) + amount_usd
+                                        )
+                                    save_user_data(telegram_id)
+                                    logging.info(f"Credited {new_token_amount} {token_name} to user {telegram_id}")
+
         except Exception as e:
             logging.error(f"Error scanning {chain} address {address}: {e}")
 
@@ -2863,8 +3084,16 @@ class AutoSweeper:
                     gas_tx = await service.fund_gas(from_address, gas_needed)
                     
                     if gas_tx:
-                        # Wait a bit for gas to arrive
-                        await asyncio.sleep(5)
+                        # Wait for the gas transaction to be mined before sweeping tokens
+                        if hasattr(service, 'wait_for_receipt'):
+                            try:
+                                await service.wait_for_receipt(gas_tx, timeout=120)
+                                logging.info(f"Gas transaction confirmed: {gas_tx}")
+                            except Exception as e:
+                                logging.error(f"Gas transaction not confirmed within timeout: {e}")
+                                return
+                        else:
+                            await asyncio.sleep(30)  # Fallback for non-EVM chains (conservative; TRON ~3s block, Solana ~0.4s)
                     else:
                         logging.error("Failed to fund gas")
                         return
@@ -12178,49 +12407,263 @@ async def bank_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                     parse_mode=ParseMode.HTML)
 
 # --- RAIN COMMAND ---
+
+def _build_rain_message(rain, participants):
+    """Build the rain announcement message text."""
+    creator = f"@{rain['creator_username']}" if rain['creator_username'] else f"User {rain['creator_id']}"
+    count = len(participants)
+    try:
+        end_dt = datetime.fromisoformat(rain['end_time'])
+        if end_dt.tzinfo is None:
+            end_dt = end_dt.replace(tzinfo=timezone.utc)
+        remaining = max(0, int((end_dt - datetime.now(timezone.utc)).total_seconds()))
+    except Exception:
+        remaining = 0
+    per_person = rain['amount'] / count if count > 0 else rain['amount']
+    lines = [
+        f"🌧️ <b>Rain Event!</b>",
+        f"",
+        f"<b>{creator}</b> is raining <b>{rain['amount']:.4f} {rain['currency']}</b> on the group!",
+        f"",
+        f"⏳ Time remaining: <b>{remaining}s</b>",
+        f"👥 Participants: <b>{count}</b>",
+        f"💰 Per person (current): <b>{per_person:.6f} {rain['currency']}</b>",
+        f"",
+        f"Press the button below to join the rain!",
+    ]
+    return "\n".join(lines)
+
+
 @check_banned
 @check_maintenance
 async def rain_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Start a group rain. Usage: /rain <amount> <currency>"""
     user = update.effective_user
     await ensure_user_in_wallets(user.id, user.username, context=context)
+
     args = update.message.text.strip().split()
-    if len(args) != 3:
-        await update.message.reply_text("Usage: /rain amount N (e.g. /rain 50 2)")
+    if len(args) < 2:
+        await update.message.reply_text(
+            "Usage: /rain <b>&lt;amount&gt;</b> [<b>&lt;currency&gt;</b>]\n\n"
+            "Examples:\n"
+            "• <code>/rain 10</code> — Rain $10 worth of your active currency\n"
+            "• <code>/rain 5 USDT</code> — Rain 5 USDT\n"
+            "• <code>/rain 0.01 ETH</code> — Rain 0.01 ETH",
+            parse_mode=ParseMode.HTML
+        )
         return
+
+    # Parse amount
     try:
         amount = float(args[1])
-        N = int(args[2])
-        if amount <= 0 or N <= 0: raise ValueError
+        if amount <= 0:
+            raise ValueError
     except ValueError:
-        await update.message.reply_text("Invalid amount or number.")
+        await update.message.reply_text("❌ Invalid amount. Please enter a positive number.")
         return
 
-    if get_active_balance_usd(user.id) < amount:
-        await update.message.reply_text("You do not have enough funds to rain.")
+    # Parse currency (default to active currency)
+    if len(args) >= 3:
+        currency = args[2].upper()
+    else:
+        currency = get_active_currency(user.id)
+
+    # Validate currency exists in wallet
+    wallet = ensure_wallet_dict(user.id)
+    if currency not in wallet and currency not in LIVE_PRICES:
+        await update.message.reply_text(f"❌ Unknown currency: <b>{currency}</b>. Use USDT, ETH, BNB, SOL, etc.", parse_mode=ParseMode.HTML)
         return
 
-    # FIXED: Eligible users are all registered users except the rainer
-    eligible = [uid for uid in user_stats.keys() if uid != user.id]
+    # Check balance
+    price = LIVE_PRICES.get(currency, 1.0)
+    amount_usd = amount * price
+    available_crypto = wallet.get(currency, 0.0)
 
-    if N > len(eligible):
-        await update.message.reply_text(f"Not enough users to rain on! Found {len(eligible)}, need {N}.")
+    if available_crypto < amount:
+        await update.message.reply_text(
+            f"❌ Insufficient balance.\n"
+            f"You need <b>{amount:.6f} {currency}</b> but have <b>{available_crypto:.6f} {currency}</b>.",
+            parse_mode=ParseMode.HTML
+        )
         return
 
-    chosen = random.sample(eligible, N)
-    portion = amount / N
-    deduct_wallet(user.id, amount)
-    rained_on_users = []
-    for uid in chosen:
-        credit_wallet(uid, portion)
-        await ensure_user_in_wallets(uid, context=context)
-        update_stats_on_rain_received(uid, portion)
-        update_pnl(uid)
-        save_user_data(uid)
-        username = user_stats.get(uid, {}).get("userinfo", {}).get("username", f"ID: {uid}")
-        rained_on_users.append(f"@{username}" if username else f"ID: {uid}")
+    if amount_usd < RAIN_MIN_AMOUNT:
+        await update.message.reply_text(
+            f"❌ Rain amount too small. Minimum is <b>${RAIN_MIN_AMOUNT:.2f}</b> (≈ {RAIN_MIN_AMOUNT/price:.6f} {currency}).",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    # Deduct immediately to lock funds
+    credit_wallet_crypto(user.id, -amount, currency)
     save_user_data(user.id)
-    rained_on_str = ", ".join(rained_on_users)
-    await update.message.reply_text(f"🌧️ Rained ${amount:.2f} on {N} users!\nEach received ${portion:.2f}.\n\nRecipients: {rained_on_str}")
+
+    # Create rain in DB
+    rain_id = str(uuid.uuid4())
+    end_time = (datetime.now(timezone.utc) + timedelta(seconds=RAIN_DURATION_SECONDS)).isoformat()
+    db = DepositDatabase()
+    db.create_rain(
+        rain_id=rain_id,
+        chat_id=update.effective_chat.id,
+        creator_id=user.id,
+        creator_username=user.username,
+        amount=amount,
+        currency=currency,
+        end_time=end_time
+    )
+
+    # Build initial rain message
+    rain = db.get_rain(rain_id)
+    text = _build_rain_message(rain, [])
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("☔ Join Rain", callback_data=f"join_rain_{rain_id}")
+    ]])
+    sent = await update.message.reply_text(text, reply_markup=keyboard, parse_mode=ParseMode.HTML)
+
+    # Store message_id for later updates
+    db.set_rain_message_id(rain_id, sent.message_id)
+
+    # Schedule job to finalize rain after duration
+    if context.job_queue:
+        context.job_queue.run_once(
+            finalize_rain_job,
+            when=RAIN_DURATION_SECONDS,
+            data={'rain_id': rain_id, 'chat_id': update.effective_chat.id, 'message_id': sent.message_id},
+            name=f"rain_{rain_id}"
+        )
+    logging.info(f"Rain {rain_id} started by {user.id} for {amount} {currency} in chat {update.effective_chat.id}")
+
+
+async def join_rain_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle a user clicking the Join Rain button."""
+    query = update.callback_query
+    await query.answer()
+
+    user = query.from_user
+    rain_id = query.data.replace("join_rain_", "", 1)
+
+    db = DepositDatabase()
+    rain = db.get_rain(rain_id)
+
+    if not rain:
+        await query.answer("❌ This rain no longer exists.", show_alert=True)
+        return
+
+    if rain['status'] != 'active':
+        await query.answer("☔ This rain has already ended!", show_alert=True)
+        return
+
+    # Check time
+    try:
+        end_dt = datetime.fromisoformat(rain['end_time'])
+        if end_dt.tzinfo is None:
+            end_dt = end_dt.replace(tzinfo=timezone.utc)
+        if datetime.now(timezone.utc) >= end_dt:
+            await query.answer("☔ This rain has already ended!", show_alert=True)
+            return
+    except Exception:
+        pass
+
+    # Prevent creator from joining their own rain
+    if user.id == rain['creator_id']:
+        await query.answer("🌂 You can't join your own rain!", show_alert=True)
+        return
+
+    # Ensure user is registered
+    await ensure_user_in_wallets(user.id, user.username, context=context)
+
+    # Add participant (returns False if already joined)
+    added = db.add_rain_participant(rain_id, user.id, user.username)
+    if not added:
+        await query.answer("✅ You've already joined this rain!", show_alert=True)
+        return
+
+    await query.answer("☔ You joined the rain!")
+
+    # Update the announcement message
+    participants = db.get_rain_participants(rain_id)
+    text = _build_rain_message(rain, participants)
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton(f"☔ Join Rain ({len(participants)})", callback_data=f"join_rain_{rain_id}")
+    ]])
+    try:
+        await query.edit_message_text(text, reply_markup=keyboard, parse_mode=ParseMode.HTML)
+    except Exception:
+        pass  # Message may have been edited too recently; ignore
+
+
+async def finalize_rain_job(context: ContextTypes.DEFAULT_TYPE):
+    """Job that fires when the rain window closes and distributes funds."""
+    data = context.job.data
+    rain_id = data['rain_id']
+    chat_id = data['chat_id']
+    message_id = data['message_id']
+
+    db = DepositDatabase()
+    rain = db.get_rain(rain_id)
+
+    if not rain or rain['status'] != 'active':
+        return  # Already completed or missing
+
+    db.complete_rain(rain_id)
+    participants = db.get_rain_participants(rain_id)
+    amount = rain['amount']
+    currency = rain['currency']
+    creator_id = rain['creator_id']
+    creator_username = rain['creator_username'] or f"User {creator_id}"
+
+    if not participants:
+        # No one joined — refund creator
+        credit_wallet_crypto(creator_id, amount, currency)
+        save_user_data(creator_id)
+        text = (
+            f"🌧️ <b>Rain Ended — No Participants</b>\n\n"
+            f"Nobody joined {creator_username}'s rain.\n"
+            f"<b>{amount:.6f} {currency}</b> has been refunded."
+        )
+    else:
+        per_person = amount / len(participants)
+        price = LIVE_PRICES.get(currency, 1.0)
+        per_person_usd = per_person * price
+        recipient_lines = []
+
+        for uid, uname in participants:
+            await ensure_user_in_wallets_sync(uid, uname, context)
+            credit_wallet_crypto(uid, per_person, currency)
+            update_stats_on_rain_received(uid, per_person_usd)
+            save_user_data(uid)
+            recipient_lines.append(f"@{uname}" if uname else f"User {uid}")
+
+        recipients_str = ", ".join(recipient_lines)
+        creator_display = f"@{rain['creator_username']}" if rain['creator_username'] else creator_username
+        text = (
+            f"🌧️ <b>Rain Complete!</b>\n\n"
+            f"<b>{creator_display}</b> rained <b>{amount:.6f} {currency}</b> on {len(participants)} user(s)!\n"
+            f"💰 Each received: <b>{per_person:.6f} {currency}</b>\n\n"
+            f"🎉 Recipients: {recipients_str}"
+        )
+
+    # Edit the original rain message
+    try:
+        await context.bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=text,
+            parse_mode=ParseMode.HTML
+        )
+    except Exception as e:
+        logging.warning(f"Could not edit rain message {message_id}: {e}")
+        # Fall back to sending a new message
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML)
+        except Exception as e2:
+            logging.error(f"Failed to send rain result message: {e2}")
+
+
+async def ensure_user_in_wallets_sync(user_id, username, context):
+    """Ensure user exists in user_wallets; calls ensure_user_in_wallets only if missing (which may involve a DB call)."""
+    if user_id not in user_wallets:
+        await ensure_user_in_wallets(user_id, username, context=context)
 
 @check_banned
 @check_maintenance
@@ -17955,6 +18398,9 @@ def main():
     app.add_handler(CallbackQueryHandler(deposit_method_callback, pattern=r"^deposit_(ETH|BNB|BASE|TRON|SOLANA|TON)$"))
     app.add_handler(CallbackQueryHandler(check_deposit_status, pattern=r"^(deposit_history|check_deposit_)"))
     app.add_handler(CallbackQueryHandler(back_to_deposit_menu, pattern=r"^back_to_deposit_menu"))
+
+    # ===== RAIN SYSTEM HANDLERS =====
+    app.add_handler(CallbackQueryHandler(join_rain_callback, pattern=r"^join_rain_"))
     
     # REMOVED bonus_callback_handler as it's no longer in the main menu
     app.add_handler(admin_handler)
